@@ -19,7 +19,7 @@ def create_lta_steer_command(packer, steer, steer_req, raw_cnt):
     "SETME_X3": 3,
     "PERCENTAGE": 100,
     "SETME_X64": 0x64,
-    "ANGLE": 0,  # Rate limit? Lower values seeem to work better, but needs more testing
+    "ANGLE": 0,
     "STEER_ANGLE_CMD": steer,
     "STEER_REQUEST": steer_req,
     "STEER_REQUEST_2": steer_req,
@@ -28,17 +28,17 @@ def create_lta_steer_command(packer, steer, steer_req, raw_cnt):
   return packer.make_can_msg("STEERING_LTA", 0, values)
 
 
-def create_accel_command(packer, accel, pcm_cancel, standstill_req, lead, acc_type):
+def create_accel_command(packer, accel, pcm_cancel, standstill_req, lead, acc_type, distance, reverse_acc_change):
   # TODO: find the exact canceling bit that does not create a chime
   values = {
     "ACCEL_CMD": accel,
     "ACC_TYPE": acc_type,
-    "DISTANCE": 0,
+    "DISTANCE": distance,
     "MINI_CAR": lead,
     "PERMIT_BRAKING": 1,
     "RELEASE_STANDSTILL": not standstill_req,
     "CANCEL_REQ": pcm_cancel,
-    "ALLOW_LONG_PRESS": 1,
+    "ALLOW_LONG_PRESS": reverse_acc_change,
   }
   return packer.make_can_msg("ACC_CONTROL", 0, values)
 
@@ -67,18 +67,21 @@ def create_fcw_command(packer, fcw):
   return packer.make_can_msg("ACC_HUD", 0, values)
 
 
-def create_ui_command(packer, steer, chime, left_line, right_line, left_lane_depart, right_lane_depart, enabled):
+def create_ui_command(packer, steer, chime, left_line, right_line, left_lane_depart, right_lane_depart, lat_active,
+                      mads_enabled):
+  faded_line = mads_enabled and not lat_active
   values = {
-    "TWO_BEEPS": chime,
-    "LDA_ALERT": steer,
-    "RIGHT_LINE": 3 if right_lane_depart else 1 if right_line else 2,
-    "LEFT_LINE": 3 if left_lane_depart else 1 if left_line else 2,
-    "BARRIERS" : 1 if enabled else 0,
+    "TWO_BEEPS": chime if mads_enabled else 0,
+    "LDA_ALERT": steer if mads_enabled else 0,
+    "RIGHT_LINE": 0 if not mads_enabled else 2 if faded_line else 3 if right_lane_depart else 1 if right_line else 2,
+    "LEFT_LINE": 0 if not mads_enabled else 2 if faded_line else 3 if left_lane_depart else 1 if left_line else 2,
+    "BARRIERS" : 1 if lat_active else 0,
+    "LKAS_STATUS": 2 if mads_enabled else 1 if mads_enabled and not lat_active else 0,
+    "LDA_ON_MESSAGE": 0,
 
     # static signals
     "SET_ME_X02": 2,
     "SET_ME_X01": 1,
-    "LKAS_STATUS": 1,
     "REPEATED_BEEPS": 0,
     "LANE_SWAY_FLD": 7,
     "LANE_SWAY_BUZZER": 0,
@@ -87,7 +90,6 @@ def create_ui_command(packer, steer, chime, left_line, right_line, left_lane_dep
     "TAKE_CONTROL": 0,
     "LANE_SWAY_SENSITIVITY": 2,
     "LANE_SWAY_TOGGLE": 1,
-    "LDA_ON_MESSAGE": 0,
     "LDA_SPEED_TOO_LOW": 0,
     "LDA_SA_TOGGLE": 1,
     "LDA_SENSITIVITY": 2,
@@ -96,5 +98,13 @@ def create_ui_command(packer, steer, chime, left_line, right_line, left_lane_dep
     "LDA_UNAVAILABLE_QUIET": 0,
     "ADJUSTING_CAMERA": 0,
     "LDW_EXIST": 1,
+  }
+  return packer.make_can_msg("LKAS_HUD", 0, values)
+
+
+def create_ui_command_disable_startup_lkas(packer):
+  values = {
+    "LKAS_STATUS": 0, # LKAS not enabled
+    "LDA_ON_MESSAGE": 0,
   }
   return packer.make_can_msg("LKAS_HUD", 0, values)

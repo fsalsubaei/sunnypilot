@@ -8,7 +8,7 @@
 #include <QWidget>
 #include <QStackedWidget>
 
-#include "selfdrive/common/params.h"
+#include "common/params.h"
 #include "selfdrive/ui/qt/widgets/controls.h"
 
 class MapPanel : public QWidget {
@@ -31,6 +31,7 @@ private:
   QVBoxLayout *recent_layout;
   QWidget *current_widget;
   ButtonControl *current_route;
+  bool custom_mapbox;
 
 signals:
   void closeSettings();

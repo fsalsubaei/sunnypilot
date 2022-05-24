@@ -11,21 +11,23 @@
 #include <QTransform>
 
 #include "cereal/messaging/messaging.h"
-#include "selfdrive/common/modeldata.h"
-#include "selfdrive/common/params.h"
-#include "selfdrive/common/timing.h"
+#include "common/modeldata.h"
+#include "common/params.h"
+#include "common/timing.h"
 
 const int bdr_s = 30;
 const int header_h = 420;
 const int footer_h = 280;
+
+const QRect speed_sgn_rc(bdr_s * 2, bdr_s * 2.5 + 202, 184, 184);
 
 const int UI_FREQ = 20;   // Hz
 typedef cereal::CarControl::HUDControl::AudibleAlert AudibleAlert;
 
 // TODO: this is also hardcoded in common/transformations/camera.py
 // TODO: choose based on frame input size
-const float y_offset = Hardware::EON() ? 0.0 : 150.0;
-const float ZOOM = Hardware::EON() ? 2138.5 : 2912.8;
+const float y_offset = 150.0;
+const float ZOOM = 2912.8;
 
 struct Alert {
   QString text1;
@@ -38,9 +40,13 @@ struct Alert {
     return text1 == a2.text1 && text2 == a2.text2 && type == a2.type && sound == a2.sound;
   }
 
-  static Alert get(const SubMaster &sm, uint64_t started_frame) {
+  static Alert get(const SubMaster &sm, uint64_t started_frame, uint64_t display_debug_alert_frame = 0) {
     const cereal::ControlsState::Reader &cs = sm["controlsState"].getControlsState();
-    if (sm.updated("controlsState")) {
+    if (display_debug_alert_frame > 0 && (sm.frame - display_debug_alert_frame) <= 1 * UI_FREQ) {
+      return {"Debug snapshot collected", "",
+              "debugTapDetected", cereal::ControlsState::AlertSize::SMALL,
+              AudibleAlert::WARNING_SOFT};
+    } else if (sm.updated("controlsState")) {
       return {cs.getAlertText1().cStr(), cs.getAlertText2().cStr(),
               cs.getAlertType().cStr(), cs.getAlertSize(),
               cs.getAlertSound()};
@@ -73,6 +79,7 @@ struct Alert {
 
 typedef enum UIStatus {
   STATUS_DISENGAGED,
+  STATUS_OVERRIDE,
   STATUS_ENGAGED,
   STATUS_WARNING,
   STATUS_ALERT,
@@ -80,9 +87,18 @@ typedef enum UIStatus {
 
 const QColor bg_colors [] = {
   [STATUS_DISENGAGED] =  QColor(0x17, 0x33, 0x49, 0xc8),
+  [STATUS_OVERRIDE] = QColor(0x91, 0x9b, 0x95, 0xf1),
   [STATUS_ENGAGED] = QColor(0x17, 0x86, 0x44, 0xf1),
   [STATUS_WARNING] = QColor(0xDA, 0x6F, 0x25, 0xf1),
   [STATUS_ALERT] = QColor(0xC9, 0x22, 0x31, 0xf1),
+};
+
+const QColor vtsc_colors [] = {
+  [int(cereal::LongitudinalPlan::VisionTurnControllerState::DISABLED)] =  QColor(0x0, 0x0, 0x0, 0xff),
+  [int(cereal::LongitudinalPlan::VisionTurnControllerState::ENTERING)] = QColor(0xC9, 0x22, 0x31, 0xf1),
+  [int(cereal::LongitudinalPlan::VisionTurnControllerState::TURNING)] = QColor(0xDA, 0x6F, 0x25, 0xf1),
+  [int(cereal::LongitudinalPlan::VisionTurnControllerState::LEAVING)
+  ] = QColor(0x17, 0x86, 0x44, 0xf1),
 };
 
 typedef struct {
@@ -93,6 +109,9 @@ typedef struct {
 typedef struct UIScene {
   mat3 view_from_calib;
   cereal::PandaState::PandaType pandaType;
+
+  cereal::LateralPlan::Reader lateral_plan;
+  cereal::ControlsState::Reader controls_state;
 
   // modelV2
   float lane_line_probs[4];
@@ -107,6 +126,34 @@ typedef struct UIScene {
   float light_sensor, accel_sensor, gyro_sensor;
   bool started, ignition, is_metric, longitudinal_control, end_to_end;
   uint64_t started_frame;
+
+  int dynamic_lane_profile;
+  struct _LateralPlan
+  {
+    bool dynamicLaneProfileStatus;
+  } lateralPlan;
+
+  bool read_params = false;
+  int onroadScreenOff, osoTimer, brightness, onroadScreenOffBrightness, awake;
+  bool touched2 = false;
+  bool stand_still_timer;
+  bool dev_ui_enabled;
+  int dev_ui_row;
+  bool gap_adjust_cruise;
+  int gap_adjust_cruise_mode;
+  int gap_adjust_cruise_tr;
+  int car_make;
+  // Debug UI
+  bool show_debug_ui;
+  bool debug_snapshot_enabled;
+  uint64_t display_debug_alert_frame;
+  // Speed limit control
+  bool speed_limit_control_enabled;
+  bool speed_limit_perc_offset;
+  double last_speed_limit_sign_tap;
+  int speed_limit_value_offset;
+
+  int speed_limit_style;
 } UIScene;
 
 class UIState : public QObject {
@@ -172,6 +219,8 @@ private:
   void updateWakefulness(const UIState &s);
   bool motionTriggered(const UIState &s);
   void setAwake(bool on);
+
+  int sleep_time = -1;
 
 signals:
   void displayPowerChanged(bool on);

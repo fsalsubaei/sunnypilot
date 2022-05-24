@@ -2,7 +2,9 @@ from cereal import car
 from selfdrive.car.volkswagen.values import CAR, BUTTON_STATES, CANBUS, NetworkLocation, TransmissionType, GearShifter
 from selfdrive.car import STD_CARGO_KG, scale_rot_inertia, scale_tire_stiffness, gen_empty_fingerprint, get_safety_config
 from selfdrive.car.interfaces import CarInterfaceBase
+from common.params import Params
 
+ButtonType = car.CarState.ButtonEvent.Type
 EventName = car.CarEvent.EventName
 
 
@@ -10,7 +12,6 @@ class CarInterface(CarInterfaceBase):
   def __init__(self, CP, CarController, CarState):
     super().__init__(CP, CarController, CarState)
 
-    self.displayMetricUnitsPrev = None
     self.buttonStatesPrev = BUTTON_STATES.copy()
 
     if CP.networkLocation == NetworkLocation.fwdCamera:
@@ -21,7 +22,7 @@ class CarInterface(CarInterfaceBase):
       self.cp_ext = self.cp_cam
 
   @staticmethod
-  def get_params(candidate, fingerprint=gen_empty_fingerprint(), car_fw=None):
+  def get_params(candidate, fingerprint=gen_empty_fingerprint(), car_fw=None, disable_radar=False):
     ret = CarInterfaceBase.get_std_params(candidate, fingerprint)
     ret.carName = "volkswagen"
     ret.radarOffCan = True
@@ -158,21 +159,23 @@ class CarInterface(CarInterfaceBase):
     ret.centerToFront = ret.wheelbase * 0.45
     ret.tireStiffnessFront, ret.tireStiffnessRear = scale_tire_stiffness(ret.mass, ret.wheelbase, ret.centerToFront,
                                                                          tire_stiffness_factor=tire_stiffness_factor)
+
+    ret.latActive = False
+
     return ret
 
   # returns a car.CarState
-  def update(self, c, can_strings):
+  def _update(self, c):
     buttonEvents = []
 
-    # Process the most recent CAN message traffic, and check for validity
-    # The camera CAN has no signals we use at this time, but we process it
-    # anyway so we can test connectivity with can_valid
-    self.cp.update_strings(can_strings)
-    self.cp_cam.update_strings(can_strings)
-
     ret = self.CS.update(self.cp, self.cp_cam, self.cp_ext, self.CP.transmissionType)
-    ret.canValid = self.cp.can_valid and self.cp_cam.can_valid
     ret.steeringRateLimited = self.CC.steer_rate_limited if self.CC is not None else False
+
+    ret.madsEnabled = self.CS.madsEnabled
+    ret.accEnabled = self.CS.accEnabled
+    ret.leftBlinkerOn = self.CS.leftBlinkerOn
+    ret.rightBlinkerOn = self.CS.rightBlinkerOn
+    ret.belowLaneChangeSpeed = self.CS.belowLaneChangeSpeed
 
     # Check for and process state-change events (button press or release) from
     # the turn stalk switch or ACC steering wheel/control stalk buttons.
@@ -183,13 +186,16 @@ class CarInterface(CarInterfaceBase):
         be.pressed = self.CS.buttonStates[button]
         buttonEvents.append(be)
 
-    events = self.create_common_events(ret, extra_gears=[GearShifter.eco, GearShifter.sport, GearShifter.manumatic])
+    # MADS BUTTON
+    if self.CS.out.madsEnabled != self.CS.madsEnabled:
+      be = car.CarState.ButtonEvent.new_message()
+      be.pressed = True
+      be.type = ButtonType.altButton1
+      buttonEvents.append(be)
 
-    # Vehicle health and operation safety checks
-    if self.CS.parkingBrakeSet:
-      events.add(EventName.parkBrake)
-    if self.CS.tsk_status in (6, 7):
-      events.add(EventName.accFaulted)
+    ret.buttonEvents = buttonEvents
+
+    events = self.create_common_events(ret, extra_gears=[GearShifter.eco, GearShifter.sport, GearShifter.manumatic], pcm_enable=False)
 
     # Low speed steer alert hysteresis logic
     if self.CP.minSteerSpeed > 0. and ret.vEgo < (self.CP.minSteerSpeed + 1.):
@@ -199,19 +205,57 @@ class CarInterface(CarInterfaceBase):
     if self.low_speed_alert:
       events.add(EventName.belowSteerSpeed)
 
-    ret.events = events.to_msg()
-    ret.buttonEvents = buttonEvents
+    self.CS.disengageByBrake = self.CS.disengageByBrake or ret.disengageByBrake
+
+    enable_pressed = False
+    enable_from_brake = False
+
+    if self.CS.disengageByBrake and not ret.brakePressed and not ret.parkingBrake and self.CS.madsEnabled:
+      enable_pressed = True
+      enable_from_brake = True
+
+    if not ret.brakePressed and not ret.parkingBrake:
+      self.CS.disengageByBrake = False
+      ret.disengageByBrake = False
+
+    for b in ret.buttonEvents:
+      # do enable on both accel and decel buttons
+      if b.type in [ButtonType.setCruise, ButtonType.resumeCruise, ButtonType.accelCruise, ButtonType.decelCruise] and not b.pressed:
+        enable_pressed = True
+      # do disable on MADS button if ACC is disabled
+      if b.type in [ButtonType.altButton1] and b.pressed:
+        if not self.CS.madsEnabled: # disabled MADS
+          if not ret.cruiseState.enabled:
+            events.add(EventName.buttonCancel)
+          else:
+            events.add(EventName.manualSteeringRequired)
+        else: # enabled MADS
+          if not ret.cruiseState.enabled:
+            enable_pressed = True
+      # do disable on button down
+      if b.type == ButtonType.cancel and b.pressed:
+        if not self.CS.madsEnabled:
+          events.add(EventName.buttonCancel)
+        else:
+          events.add(EventName.manualLongitudinalRequired)
+    if (ret.cruiseState.enabled or self.CS.madsEnabled) and enable_pressed:
+      if enable_from_brake:
+        events.add(EventName.silentButtonEnable)
+      else:
+        events.add(EventName.buttonEnable)
+
+    self.CP.latActive = True if self.CC.lat_active else False
 
     # update previous car states
-    self.displayMetricUnitsPrev = self.CS.displayMetricUnits
     self.buttonStatesPrev = self.CS.buttonStates.copy()
 
-    self.CS.out = ret.as_reader()
-    return self.CS.out
+    ret.events = events.to_msg()
+
+    return ret
 
   def apply(self, c):
     hud_control = c.hudControl
-    ret = self.CC.update(c, c.enabled, self.CS, self.frame, self.ext_bus, c.actuators,
+    ret = self.CC.update(c, self.CS, self.frame, self.ext_bus, c.actuators,
                          hud_control.visualAlert,
                          hud_control.leftLaneVisible,
                          hud_control.rightLaneVisible,

@@ -3,23 +3,22 @@ from cereal import log
 from common.filter_simple import FirstOrderFilter
 from common.numpy_fast import interp
 from common.realtime import DT_MDL
-from selfdrive.hardware import EON, TICI
+from selfdrive.hardware import TICI
 from selfdrive.swaglog import cloudlog
+from common.params import Params
+from decimal import Decimal
 
 
 TRAJECTORY_SIZE = 33
 # camera offset is meters from center car to camera
-# model path is in the frame of EON's camera. TICI is 0.1 m away,
-# however the average measured path difference is 0.04 m
-if EON:
-  CAMERA_OFFSET = -0.06
-  PATH_OFFSET = 0.0
-elif TICI:
+# model path is in the frame of the camera. Empirically 
+# the model knows the difference between TICI and EON
+# so a path offset is not needed
+PATH_OFFSET = 0.00
+if TICI:
   CAMERA_OFFSET = 0.04
-  PATH_OFFSET = 0.04
 else:
   CAMERA_OFFSET = 0.0
-  PATH_OFFSET = 0.0
 
 
 class LanePlanner:
@@ -45,7 +44,21 @@ class LanePlanner:
     self.camera_offset = -CAMERA_OFFSET if wide_camera else CAMERA_OFFSET
     self.path_offset = -PATH_OFFSET if wide_camera else PATH_OFFSET
 
+    self.params = Params()
+    self.frame = 0
+    self.custom_offsets = False
+    self.custom_offsets_timer = 0
+    self._camera_offset = 0.00
+    self._path_offset = 0.00
+    self._wide_camera = wide_camera
+
   def parse_model(self, md):
+    self.custom_offsets_timer += 1
+    if self.custom_offsets_timer > 100:
+      self.custom_offsets_timer = 0
+      self.custom_offsets = self.params.get_bool("CustomOffsets")
+    if self.custom_offsets:
+      self.get_custom_offsets()
     lane_lines = md.laneLines
     if len(lane_lines) == 4 and len(lane_lines[0].t) == TRAJECTORY_SIZE:
       self.ll_t = (np.array(lane_lines[1].t) + np.array(lane_lines[2].t))/2
@@ -62,6 +75,17 @@ class LanePlanner:
     if len(desire_state):
       self.l_lane_change_prob = desire_state[log.LateralPlan.Desire.laneChangeLeft]
       self.r_lane_change_prob = desire_state[log.LateralPlan.Desire.laneChangeRight]
+
+  def get_custom_offsets(self):
+    self.frame += 1
+    if self.frame % 300 == 0:
+      self._camera_offset = float(Decimal(self.params.get("CameraOffset", encoding="utf8")) * Decimal('0.01'))
+      self._path_offset = float(Decimal(self.params.get("PathOffset", encoding="utf8")) * Decimal('0.01'))
+      self.camera_offset = -CAMERA_OFFSET + self._camera_offset if self._wide_camera else \
+                            CAMERA_OFFSET + self._camera_offset
+      self.path_offset = -PATH_OFFSET + self._path_offset if self._wide_camera else \
+                          PATH_OFFSET + self._path_offset
+      self.frame = 0
 
   def get_d_path(self, v_ego, path_t, path_xyz):
     # Reduce reliance on lanelines that are too far apart or

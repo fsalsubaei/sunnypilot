@@ -1,7 +1,7 @@
 import copy
 from cereal import car
 from opendbc.can.can_define import CANDefine
-from selfdrive.config import Conversions as CV
+from common.conversions import Conversions as CV
 from selfdrive.car.interfaces import CarStateBase
 from opendbc.can.parser import CANParser
 from selfdrive.car.subaru.values import DBC, STEER_THRESHOLD, CAR, PREGLOBAL_CARS
@@ -16,12 +16,20 @@ class CarState(CarStateBase):
   def update(self, cp, cp_cam):
     ret = car.CarState.new_message()
 
+    self.visual_brake_lights = self.params.get_bool("BrakeLights")
+
     ret.gas = cp.vl["Throttle"]["Throttle_Pedal"] / 255.
     ret.gasPressed = ret.gas > 1e-5
     if self.car_fingerprint in PREGLOBAL_CARS:
       ret.brakePressed = cp.vl["Brake_Pedal"]["Brake_Pedal"] > 2
     else:
       ret.brakePressed = cp.vl["Brake_Status"]["Brake"] == 1
+
+    if self.visual_brake_lights:
+      if self.car_fingerprint in PREGLOBAL_CARS:
+        ret.brakeLights = bool(cp_cam.vl["ES_Brake"]["Brake_Light"] or ret.brakePressed)
+      else:
+        ret.brakeLights = bool(cp_cam.vl["ES_DashStatus"]["Brake_Lights"] or ret.brakePressed)
 
     ret.wheelSpeeds = self.get_wheel_speeds(
       cp.vl["Wheel_Speeds"]["FL"],
@@ -62,13 +70,13 @@ class CarState(CarStateBase):
                         cp.vl["BodyInfo"]["DOOR_OPEN_RL"],
                         cp.vl["BodyInfo"]["DOOR_OPEN_FR"],
                         cp.vl["BodyInfo"]["DOOR_OPEN_FL"]])
-    ret.steerError = cp.vl["Steering_Torque"]["Steer_Error_1"] == 1
+    ret.steerFaultPermanent = cp.vl["Steering_Torque"]["Steer_Error_1"] == 1
 
     if self.car_fingerprint in PREGLOBAL_CARS:
       self.cruise_button = cp_cam.vl["ES_Distance"]["Cruise_Button"]
       self.ready = not cp_cam.vl["ES_DashStatus"]["Not_Ready_Startup"]
     else:
-      ret.steerWarning = cp.vl["Steering_Torque"]["Steer_Warning"] == 1
+      ret.steerFaultTemporary = cp.vl["Steering_Torque"]["Steer_Warning"] == 1
       ret.cruiseState.nonAdaptive = cp_cam.vl["ES_DashStatus"]["Conventional_Cruise"] == 1
       self.es_lkas_msg = copy.copy(cp_cam.vl["ES_LKAS_State"])
     self.es_distance_msg = copy.copy(cp_cam.vl["ES_Distance"])
@@ -177,11 +185,13 @@ class CarState(CarStateBase):
         ("Signal6", "ES_Distance"),
         ("Cruise_Button", "ES_Distance"),
         ("Signal7", "ES_Distance"),
+        ("Brake_Light", "ES_Brake", 0),
       ]
 
       checks = [
         ("ES_DashStatus", 20),
         ("ES_Distance", 20),
+        ("ES_Brake", 20),
       ]
     else:
       signals = [

@@ -4,12 +4,13 @@
 #include <cmath>
 
 #include <QtConcurrent>
+#include <string>
 
 #include "common/transformations/orientation.hpp"
-#include "selfdrive/common/params.h"
-#include "selfdrive/common/swaglog.h"
-#include "selfdrive/common/util.h"
-#include "selfdrive/common/watchdog.h"
+#include "common/params.h"
+#include "common/swaglog.h"
+#include "common/util.h"
+#include "common/watchdog.h"
 #include "selfdrive/hardware/hw.h"
 
 #define BACKLIGHT_DT 0.05
@@ -55,17 +56,33 @@ static void update_leads(UIState *s, const cereal::RadarState::Reader &radar_sta
 }
 
 static void update_line_data(const UIState *s, const cereal::ModelDataV2::XYZTData::Reader &line,
-                             float y_off, float z_off, line_vertices_data *pvd, int max_idx) {
+                             float y_off, float z_off, line_vertices_data *pvd, int max_idx, bool allow_invert=true) {
   const auto line_x = line.getX(), line_y = line.getY(), line_z = line.getZ();
-  QPointF *v = &pvd->v[0];
+
+  std::vector<QPointF> left_points, right_points;
   for (int i = 0; i <= max_idx; i++) {
-    v += calib_frame_to_full_frame(s, line_x[i], line_y[i] - y_off, line_z[i] + z_off, v);
+    QPointF left, right;
+    bool l = calib_frame_to_full_frame(s, line_x[i], line_y[i] - y_off, line_z[i] + z_off, &left);
+    bool r = calib_frame_to_full_frame(s, line_x[i], line_y[i] + y_off, line_z[i] + z_off, &right);
+    if (l && r) {
+      // For wider lines the drawn polygon will "invert" when going over a hill and cause artifacts
+      if (!allow_invert && left_points.size() && left.y() > left_points.back().y()) {
+        continue;
+      }
+      left_points.push_back(left);
+      right_points.push_back(right);
+    }
   }
-  for (int i = max_idx; i >= 0; i--) {
-    v += calib_frame_to_full_frame(s, line_x[i], line_y[i] + y_off, line_z[i] + z_off, v);
-  }
-  pvd->cnt = v - pvd->v;
+
+  pvd->cnt = 2 * left_points.size();
+  assert(left_points.size() == right_points.size());
   assert(pvd->cnt <= std::size(pvd->v));
+
+  for (int left_idx = 0; left_idx < left_points.size(); left_idx++){
+    int right_idx = 2 * left_points.size() - left_idx - 1;
+    pvd->v[left_idx] = left_points[left_idx];
+    pvd->v[right_idx] = right_points[left_idx];
+  }
 }
 
 static void update_model(UIState *s, const cereal::ModelDataV2::Reader &model) {
@@ -98,7 +115,7 @@ static void update_model(UIState *s, const cereal::ModelDataV2::Reader &model) {
     max_distance = std::clamp((float)(lead_d - fmin(lead_d * 0.35, 10.)), 0.0f, max_distance);
   }
   max_idx = get_path_length_idx(model_position, max_distance);
-  update_line_data(s, model_position, 0.5, 1.22, &scene.track_vertices, max_idx);
+  update_line_data(s, model_position, 0.9, 1.22, &scene.track_vertices, max_idx, false);
 }
 
 static void update_sockets(UIState *s) {
@@ -166,20 +183,10 @@ static void update_state(UIState *s) {
       }
     }
   }
-  if (!Hardware::TICI() && sm.updated("roadCameraState")) {
-    auto camera_state = sm["roadCameraState"].getRoadCameraState();
-
-    float max_lines = Hardware::EON() ? 5408 : 1904;
-    float max_gain = Hardware::EON() ? 1.0: 10.0;
-    float max_ev = max_lines * max_gain;
-
-    float ev = camera_state.getGain() * float(camera_state.getIntegLines());
-
-    scene.light_sensor = std::clamp<float>(1.0 - (ev / max_ev), 0.0, 1.0);
-  } else if (Hardware::TICI() && sm.updated("wideRoadCameraState")) {
+  if (Hardware::TICI() && sm.updated("wideRoadCameraState")) {
     auto camera_state = sm["wideRoadCameraState"].getWideRoadCameraState();
 
-    float max_lines = 1904;
+    float max_lines = 1618;
     float max_gain = 10.0;
     float max_ev = max_lines * max_gain / 6;
 
@@ -188,22 +195,57 @@ static void update_state(UIState *s) {
     scene.light_sensor = std::clamp<float>(1.0 - (ev / max_ev), 0.0, 1.0);
   }
   scene.started = sm["deviceState"].getDeviceState().getStarted() && scene.ignition;
+  if (sm.updated("lateralPlan")) {
+    auto data = sm["lateralPlan"].getLateralPlan();
+
+    scene.lateralPlan.dynamicLaneProfileStatus = data.getDynamicLaneProfile();
+  }
 }
 
 void ui_update_params(UIState *s) {
   s->scene.is_metric = Params().getBool("IsMetric");
+
+  if (!s->scene.read_params) {
+    s->scene.onroadScreenOff = std::stoi(Params().get("OnroadScreenOff"));
+    s->scene.onroadScreenOffBrightness = std::stoi(Params().get("OnroadScreenOffBrightness"));
+    s->scene.brightness = std::stoi(Params().get("BrightnessControl"));
+
+    if (s->scene.onroadScreenOff > 0) {
+      s->scene.osoTimer = s->scene.onroadScreenOff * 60 * UI_FREQ;
+    } else if (s->scene.onroadScreenOff == 0) {
+      s->scene.osoTimer = 30 * UI_FREQ;
+    } else if (s->scene.onroadScreenOff == -1) {
+      s->scene.osoTimer = 15 * UI_FREQ;
+    } else {
+      s->scene.osoTimer = -1;
+    }
+
+    s->scene.stand_still_timer = Params().getBool("StandStillTimer");
+    s->scene.dev_ui_enabled = Params().getBool("DevUI");
+    s->scene.dev_ui_row = std::stoi(Params().get("DevUIRow"));
+    s->scene.gap_adjust_cruise = Params().getBool("GapAdjustCruise");
+    s->scene.gap_adjust_cruise_mode = std::stoi(Params().get("GapAdjustCruiseMode"));
+    s->scene.gap_adjust_cruise_tr = std::stoi(Params().get("GapAdjustCruiseTr"));
+    s->scene.car_make = std::stoi(Params().get("CarMake"));
+    s->scene.speed_limit_style = std::stoi(Params().get("SpeedLimitStyle"));
+  }
 }
 
 void UIState::updateStatus() {
   if (scene.started && sm->updated("controlsState")) {
     auto controls_state = (*sm)["controlsState"].getControlsState();
+    auto car_control = (*sm)["carControl"].getCarControl();
+    auto car_state = (*sm)["carState"].getCarState();
     auto alert_status = controls_state.getAlertStatus();
+    auto state = controls_state.getState();
     if (alert_status == cereal::ControlsState::AlertStatus::USER_PROMPT) {
       status = STATUS_WARNING;
     } else if (alert_status == cereal::ControlsState::AlertStatus::CRITICAL) {
       status = STATUS_ALERT;
+    } else if (state == cereal::ControlsState::OpenpilotState::PRE_ENABLED || state == cereal::ControlsState::OpenpilotState::OVERRIDING) {
+      status = STATUS_OVERRIDE;
     } else {
-      status = controls_state.getEnabled() ? STATUS_ENGAGED : STATUS_DISENGAGED;
+      status = car_state.getMadsEnabled() ? car_control.getLongActive() ? STATUS_ENGAGED : STATUS_DISENGAGED : STATUS_DISENGAGED;
     }
   }
 
@@ -214,6 +256,12 @@ void UIState::updateStatus() {
       scene.started_frame = sm->frame;
       scene.end_to_end = Params().getBool("EndToEndToggle");
       wide_camera = Hardware::TICI() ? Params().getBool("EnableWideCamera") : false;
+      scene.dynamic_lane_profile = std::stoi(Params().get("DynamicLaneProfile"));
+      scene.show_debug_ui = Params().getBool("ShowDebugUI");
+      scene.speed_limit_control_enabled = Params().getBool("SpeedLimitControl");
+      scene.speed_limit_perc_offset = Params().getBool("SpeedLimitPercOffset");
+      scene.speed_limit_value_offset = std::stoi(Params().get("SpeedLimitValueOffset"));
+      scene.debug_snapshot_enabled = Params().getBool("EnableDebugSnapshot");
     }
     started_prev = scene.started;
     emit offroadTransition(!scene.started);
@@ -224,7 +272,7 @@ UIState::UIState(QObject *parent) : QObject(parent) {
   sm = std::make_unique<SubMaster, const std::initializer_list<const char *>>({
     "modelV2", "controlsState", "liveCalibration", "radarState", "deviceState", "roadCameraState",
     "pandaStates", "carParams", "driverMonitoringState", "sensorEvents", "carState", "liveLocationKalman",
-    "wideRoadCameraState",
+    "wideRoadCameraState", "managerState", "navInstruction", "navRoute", "carControl", "lateralPlan", "gpsLocationExternal", "longitudinalPlan", "liveMapData",
   });
 
   Params params;
@@ -291,11 +339,25 @@ void Device::updateBrightness(const UIState &s) {
 
     // Scale back to 10% to 100%
     clipped_brightness = std::clamp(100.0f * clipped_brightness, 10.0f, 100.0f);
+
+    if (s.scene.onroadScreenOff != -2 && s.scene.touched2) {
+      sleep_time = s.scene.osoTimer;
+    } else if (s.scene.controls_state.getAlertSize() != cereal::ControlsState::AlertSize::NONE && s.scene.onroadScreenOff != -2) {
+      sleep_time = s.scene.osoTimer;
+    } else if (sleep_time > 0 && s.scene.onroadScreenOff != -2) {
+      sleep_time--;
+    } else if (s.scene.started && sleep_time == -1 && s.scene.onroadScreenOff != -2) {
+      sleep_time = s.scene.osoTimer;
+    }
   }
 
   int brightness = brightness_filter.update(clipped_brightness);
   if (!awake) {
     brightness = 0;
+  } else if (s.scene.started && sleep_time == 0 && s.scene.onroadScreenOff != -2) {
+    brightness = s.scene.onroadScreenOffBrightness * 0.01 * brightness;
+  } else if( s.scene.brightness ) {
+    brightness = s.scene.brightness * 0.99;
   }
 
   if (brightness != last_brightness) {

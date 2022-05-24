@@ -1,16 +1,24 @@
+from collections import deque
 import copy
+
 from cereal import car
-from selfdrive.car.hyundai.values import DBC, STEER_THRESHOLD, FEATURES, EV_CAR, HYBRID_CAR
-from selfdrive.car.interfaces import CarStateBase
+from common.conversions import Conversions as CV
 from opendbc.can.parser import CANParser
 from opendbc.can.can_define import CANDefine
-from selfdrive.config import Conversions as CV
+from selfdrive.car.hyundai.values import DBC, STEER_THRESHOLD, FEATURES, EV_CAR, HYBRID_CAR, Buttons
+from selfdrive.car.interfaces import CarStateBase
+from common.params import Params
+
+PREV_BUTTON_SAMPLES = 4
 
 
 class CarState(CarStateBase):
   def __init__(self, CP):
     super().__init__(CP)
     can_define = CANDefine(DBC[CP.carFingerprint]["pt"])
+
+    self.cruise_buttons = deque([Buttons.NONE] * PREV_BUTTON_SAMPLES, maxlen=PREV_BUTTON_SAMPLES)
+    self.main_buttons = deque([Buttons.NONE] * PREV_BUTTON_SAMPLES, maxlen=PREV_BUTTON_SAMPLES)
 
     if self.CP.carFingerprint in FEATURES["use_cluster_gears"]:
       self.shifter_values = can_define.dv["CLU15"]["CF_Clu_Gear"]
@@ -19,9 +27,41 @@ class CarState(CarStateBase):
     else:  # preferred and elect gear methods use same definition
       self.shifter_values = can_define.dv["LVR12"]["CF_Lvr_Gear"]
 
+    self.params = Params()
+    self.enable_mads = self.params.get_bool("EnableMads")
+    self.mads_disengage_lateral_on_brake = self.params.get_bool("DisengageLateralOnBrake")
+
+    self.accEnabled = False
+    self.madsEnabled = False
+    self.leftBlinkerOn = False
+    self.rightBlinkerOn = False
+    self.disengageByBrake = False
+    self.belowLaneChangeSpeed = True
+    self.mainEnabled = False
+
+    self.mads_enabled = None
+    self.prev_mads_enabled = None
+
+    self.prev_cruiseState_enabled = False
+
+    self.acc_mads_combo = None
+    self.prev_acc_mads_combo = None
+
+    self.cruiseState_standstill = False
 
   def update(self, cp, cp_cam):
     ret = car.CarState.new_message()
+
+    self.prev_mads_enabled = self.mads_enabled
+    self.prev_cruise_buttons = self.cruise_buttons[-1]
+    self.prev_main_buttons = self.main_buttons[-1]
+    self.cruise_buttons.extend(cp.vl_all["CLU11"]["CF_Clu_CruiseSwState"])
+    self.main_buttons.extend(cp.vl_all["CLU11"]["CF_Clu_CruiseSwMain"])
+    self.acc_mads_combo = self.params.get_bool("AccMadsCombo")
+    self.visual_brake_lights = self.params.get_bool("BrakeLights")
+    self.gap_adjust_cruise = Params().get_bool("GapAdjustCruise")
+    self.gap_adjust_cruise_mode = int(Params().get("GapAdjustCruiseMode"))
+    self.gap_adjust_cruise_tr = int(Params().get("GapAdjustCruiseTr"))
 
     ret.doorOpen = any([cp.vl["CGW1"]["CF_Gway_DrvDrSw"], cp.vl["CGW1"]["CF_Gway_AstDrSw"],
                         cp.vl["CGW2"]["CF_Gway_RLDrSw"], cp.vl["CGW2"]["CF_Gway_RRDrSw"]])
@@ -37,7 +77,25 @@ class CarState(CarStateBase):
     ret.vEgoRaw = (ret.wheelSpeeds.fl + ret.wheelSpeeds.fr + ret.wheelSpeeds.rl + ret.wheelSpeeds.rr) / 4.
     ret.vEgo, ret.aEgo = self.update_speed_kf(ret.vEgoRaw)
 
+    # TODO: Find brake pressure
+    ret.brake = 0
+    ret.brakePressed = cp.vl["TCS13"]["DriverBraking"] != 0
+    ret.brakeHoldActive = cp.vl["TCS15"]["AVH_LAMP"] == 2 # 0 OFF, 1 ERROR, 2 ACTIVE, 3 READY
+    ret.parkingBrake = cp.vl["TCS13"]["PBRAKE_ACT"] == 1
+    ret.brakeLights = bool(self.visual_brake_lights and (cp.vl["TCS13"]["BrakeLight"] or ret.brakePressed or ret.brakeHoldActive or ret.parkingBrake))
+
+    self.belowLaneChangeSpeed = ret.vEgo < (30 * CV.MPH_TO_MS)
+
+    if self.CP.carFingerprint in FEATURES["use_lfa_button"]:
+      self.mads_enabled = cp.vl["BCM_PO_11"]["LFA_Pressed"] == 0
+    else:
+      self.mads_enabled = cp.vl["CLU11"]["CF_Clu_CruiseSwMain"] == 0
+
+    if self.prev_mads_enabled is None:
+      self.prev_mads_enabled = self.mads_enabled
+
     ret.standstill = ret.vEgoRaw < 0.1
+    ret.standStill = self.CP.standStill
 
     ret.steeringAngleDeg = cp.vl["SAS11"]["SAS_Angle"]
     ret.steeringRateDeg = cp.vl["SAS11"]["SAS_Speed"]
@@ -47,29 +105,92 @@ class CarState(CarStateBase):
     ret.steeringTorque = cp.vl["MDPS12"]["CR_Mdps_StrColTq"]
     ret.steeringTorqueEps = cp.vl["MDPS12"]["CR_Mdps_OutTq"]
     ret.steeringPressed = abs(ret.steeringTorque) > STEER_THRESHOLD
-    ret.steerWarning = cp.vl["MDPS12"]["CF_Mdps_ToiUnavail"] != 0 or cp.vl["MDPS12"]["CF_Mdps_ToiFlt"] != 0
+
+    self.leftBlinkerOn = cp.vl["CGW1"]["CF_Gway_TurnSigLh"] != 0
+    self.rightBlinkerOn = cp.vl["CGW1"]["CF_Gway_TurnSigRh"] != 0
 
     # cruise state
     if self.CP.openpilotLongitudinalControl:
+      if self.prev_main_buttons != 1:
+        if self.main_buttons[-1] == 1:
+          self.mainEnabled = not self.mainEnabled
       # These are not used for engage/disengage since openpilot keeps track of state using the buttons
-      ret.cruiseState.available = cp.vl["TCS13"]["ACCEnable"] == 0
-      ret.cruiseState.enabled = cp.vl["TCS13"]["ACC_REQ"] == 1
+      ret.cruiseState.available = cp.vl["TCS13"]["ACCEnable"] == 0 and self.mainEnabled == True
+      ret.cruiseState.enabled = cp.vl["TCS13"]["ACC_REQ"] == 1 and self.accEnabled == True
       ret.cruiseState.standstill = False
     else:
       ret.cruiseState.available = cp.vl["SCC11"]["MainMode_ACC"] == 1
       ret.cruiseState.enabled = cp.vl["SCC12"]["ACCMode"] != 0
       ret.cruiseState.standstill = cp.vl["SCC11"]["SCCInfoDisplay"] == 4.
+      speed_conv = CV.MPH_TO_MS if cp.vl["CLU11"]["CF_Clu_SPEED_UNIT"] else CV.KPH_TO_MS
+      ret.cruiseState.speed = cp.vl["SCC11"]["VSetDis"] * speed_conv
 
-      if ret.cruiseState.enabled:
-        speed_conv = CV.MPH_TO_MS if cp.vl["CLU11"]["CF_Clu_SPEED_UNIT"] else CV.KPH_TO_MS
-        ret.cruiseState.speed = cp.vl["SCC11"]["VSetDis"] * speed_conv
-      else:
-        ret.cruiseState.speed = 0
+    self.cruiseState_standstill = ret.cruiseState.standstill
 
-    # TODO: Find brake pressure
-    ret.brake = 0
-    ret.brakePressed = cp.vl["TCS13"]["DriverBraking"] != 0
-    ret.brakeHoldActive = cp.vl["TCS15"]["AVH_LAMP"] == 2 # 0 OFF, 1 ERROR, 2 ACTIVE, 3 READY
+    if ret.cruiseState.available:
+      if not self.CP.pcmCruise or not self.CP.pcmCruiseSpeed:
+        if self.prev_cruise_buttons == 2: # SET-
+          if self.cruise_buttons[-1] != 2:
+            self.accEnabled = True
+        elif self.prev_cruise_buttons == 1: # RESUME+
+          if self.cruise_buttons[-1] != 1:
+            self.accEnabled = True
+        if self.gap_adjust_cruise:
+          if self.gap_adjust_cruise_mode in (0, 2):
+            if self.prev_cruise_buttons != 3: # GAP
+              if self.cruise_buttons[-1] == 3:
+                self.gap_adjust_cruise_tr -= 1
+                if self.gap_adjust_cruise_tr < 1:
+                  self.gap_adjust_cruise_tr = 4
+                Params().put("GapAdjustCruiseTr", str(self.gap_adjust_cruise_tr))
+        else:
+          self.gap_adjust_cruise_tr = 4
+      if self.enable_mads:
+        if self.prev_mads_enabled != 1:
+          if self.mads_enabled == 1:
+            self.madsEnabled = not self.madsEnabled
+        if self.acc_mads_combo:
+          if not self.prev_acc_mads_combo and ret.cruiseState.enabled:
+            self.madsEnabled = True
+          self.prev_acc_mads_combo = ret.cruiseState.enabled
+    else:
+      self.madsEnabled = False
+      self.accEnabled = False
+
+    ret.gapAdjustCruiseTr = self.gap_adjust_cruise_tr
+
+    if not self.CP.pcmCruise or (self.CP.pcmCruise and self.CP.minEnableSpeed > 0) or not self.enable_mads or not self.CP.pcmCruiseSpeed:
+      if self.prev_cruise_buttons != 4: # CANCEL
+        if self.cruise_buttons[-1] == 4:
+          self.accEnabled = False
+          if not self.enable_mads:
+            self.madsEnabled = False
+      if ret.brakePressed:
+        self.accEnabled = False
+        if not self.enable_mads:
+          self.madsEnabled = False
+
+    if self.CP.pcmCruise and self.CP.minEnableSpeed > 0 and self.CP.pcmCruiseSpeed:
+      if ret.gasPressed and not ret.cruiseState.enabled:
+        self.accEnabled = False
+      self.accEnabled = ret.cruiseState.enabled or self.accEnabled
+
+    if not self.CP.pcmCruise or not self.CP.pcmCruiseSpeed:
+      ret.cruiseState.enabled = self.accEnabled
+
+    if not self.enable_mads:
+      if ret.cruiseState.enabled and not self.prev_cruiseState_enabled:
+        self.madsEnabled = True
+    self.prev_cruiseState_enabled = ret.cruiseState.enabled
+
+    ret.steerFaultTemporary = False
+
+    if self.madsEnabled:
+      if (not self.belowLaneChangeSpeed and (self.rightBlinkerOn or self.leftBlinkerOn)) or\
+        not (self.rightBlinkerOn or self.leftBlinkerOn):
+        ret.steerFaultTemporary = cp.vl["MDPS12"]["CF_Mdps_ToiUnavail"] != 0 or cp.vl["MDPS12"]["CF_Mdps_ToiFlt"] != 0
+
+    ret.latActive = self.CP.latActive
 
     if self.CP.carFingerprint in (HYBRID_CAR | EV_CAR):
       if self.CP.carFingerprint in HYBRID_CAR:
@@ -109,11 +230,9 @@ class CarState(CarStateBase):
     # save the entire LKAS11 and CLU11
     self.lkas11 = copy.copy(cp_cam.vl["LKAS11"])
     self.clu11 = copy.copy(cp.vl["CLU11"])
-    self.park_brake = cp.vl["TCS13"]["PBRAKE_ACT"] == 1
     self.steer_state = cp.vl["MDPS12"]["CF_Mdps_ToiActive"]  # 0 NOT ACTIVE, 1 ACTIVE
-    self.brake_error = cp.vl["TCS13"]["ACCEnable"] != 0 # 0 ACC CONTROL ENABLED, 1-3 ACC CONTROL DISABLED
-    self.prev_cruise_buttons = self.cruise_buttons
-    self.cruise_buttons = cp.vl["CLU11"]["CF_Clu_CruiseSwState"]
+    self.brake_error = cp.vl["TCS13"]["ACCEnable"] != 0  # 0 ACC CONTROL ENABLED, 1-3 ACC CONTROL DISABLED
+    self.brake_control_active = cp.vl["TCS13"]["DCEnable"] == 1
 
     return ret
 
@@ -155,7 +274,9 @@ class CarState(CarStateBase):
       ("CF_Clu_AliveCnt1", "CLU11"),
 
       ("ACCEnable", "TCS13"),
+      ("DCEnable", "TCS13"),
       ("ACC_REQ", "TCS13"),
+      ("BrakeLight", "TCS13", 0),
       ("DriverBraking", "TCS13"),
       ("StandStill", "TCS13"),
       ("PBRAKE_ACT", "TCS13"),
@@ -248,6 +369,10 @@ class CarState(CarStateBase):
     else:
       signals.append(("CF_Lvr_Gear", "LVR12"))
       checks.append(("LVR12", 100))
+
+    if CP.carFingerprint in FEATURES["use_lfa_button"]:
+      signals.append(("LFA_Pressed", "BCM_PO_11"))
+      checks.append(("BCM_PO_11", 50))
 
     return CANParser(DBC[CP.carFingerprint]["pt"], signals, checks, 0)
 

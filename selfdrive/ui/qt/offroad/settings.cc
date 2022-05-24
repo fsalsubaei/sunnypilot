@@ -6,21 +6,20 @@
 
 #include <QDebug>
 
-#ifndef QCOM
 #include "selfdrive/ui/qt/offroad/networking.h"
-#endif
 
 #ifdef ENABLE_MAPS
 #include "selfdrive/ui/qt/maps/map_settings.h"
 #endif
 
-#include "selfdrive/common/params.h"
-#include "selfdrive/common/util.h"
+#include "common/params.h"
+#include "common/util.h"
 #include "selfdrive/hardware/hw.h"
 #include "selfdrive/ui/qt/widgets/controls.h"
 #include "selfdrive/ui/qt/widgets/input.h"
 #include "selfdrive/ui/qt/widgets/scrollview.h"
 #include "selfdrive/ui/qt/widgets/ssh_keys.h"
+#include "selfdrive/ui/qt/offroad/sunnypilot_settings.h"
 #include "selfdrive/ui/qt/widgets/toggle.h"
 #include "selfdrive/ui/ui.h"
 #include "selfdrive/ui/qt/util.h"
@@ -65,6 +64,12 @@ TogglesPanel::TogglesPanel(SettingsWindow *parent) : ListWidget(parent) {
       "In this mode openpilot will ignore lanelines and just drive how it thinks a human would.",
       "../assets/offroad/icon_road.png",
     },
+    {
+      "DisengageOnAccelerator",
+      "Disengage On Accelerator Pedal",
+      "When enabled, pressing the accelerator pedal will disengage openpilot.",
+      "../assets/offroad/icon_disengage_on_accelerator.svg",
+    },
 #ifdef ENABLE_MAPS
     {
       "NavSettingTime24h",
@@ -83,6 +88,12 @@ TogglesPanel::TogglesPanel(SettingsWindow *parent) : ListWidget(parent) {
       "DisableRadar",
       "openpilot Longitudinal Control",
       "openpilot will disable the car's radar and will take over control of gas and brakes. Warning: this disables AEB!",
+      "../assets/offroad/icon_speed_limit.png",
+    });
+    toggles.push_back({
+      "EnhancedScc",
+      "Enhanced SCC Radar Interceptor*",
+      "openpilot will take over control of gas and brakes and will NOT disable the car's radar. This preserves AEB.\nOnly enable this feature if you have the Enhanced SCC Radar Interceptor hardware installed.\nWant to get one for your car? Reach out to sunnyhaibin#0865 on Discord for more information.",
       "../assets/offroad/icon_speed_limit.png",
     });
   }
@@ -284,57 +295,8 @@ void SoftwarePanel::updateLabels() {
   osVersionLbl->setText(QString::fromStdString(Hardware::get_os_version()).trimmed());
 }
 
-C2NetworkPanel::C2NetworkPanel(QWidget *parent) : QWidget(parent) {
-  QVBoxLayout *layout = new QVBoxLayout(this);
-  layout->setContentsMargins(50, 0, 50, 0);
-
-  ListWidget *list = new ListWidget();
-  list->setSpacing(30);
-  // wifi + tethering buttons
-#ifdef QCOM
-  auto wifiBtn = new ButtonControl("Wi-Fi Settings", "OPEN");
-  QObject::connect(wifiBtn, &ButtonControl::clicked, [=]() { HardwareEon::launch_wifi(); });
-  list->addItem(wifiBtn);
-
-  auto tetheringBtn = new ButtonControl("Tethering Settings", "OPEN");
-  QObject::connect(tetheringBtn, &ButtonControl::clicked, [=]() { HardwareEon::launch_tethering(); });
-  list->addItem(tetheringBtn);
-#endif
-  ipaddress = new LabelControl("IP Address", "");
-  list->addItem(ipaddress);
-
-  // SSH key management
-  list->addItem(new SshToggle());
-  list->addItem(new SshControl());
-  layout->addWidget(list);
-  layout->addStretch(1);
-}
-
-void C2NetworkPanel::showEvent(QShowEvent *event) {
-  ipaddress->setText(getIPAddress());
-}
-
-QString C2NetworkPanel::getIPAddress() {
-  std::string result = util::check_output("ifconfig wlan0");
-  if (result.empty()) return "";
-
-  const std::string inetaddrr = "inet addr:";
-  std::string::size_type begin = result.find(inetaddrr);
-  if (begin == std::string::npos) return "";
-
-  begin += inetaddrr.length();
-  std::string::size_type end = result.find(' ', begin);
-  if (end == std::string::npos) return "";
-
-  return result.substr(begin, end - begin).c_str();
-}
-
 QWidget *network_panel(QWidget *parent) {
-#ifdef QCOM
-  return new C2NetworkPanel(parent);
-#else
   return new Networking(parent);
-#endif
 }
 
 void SettingsWindow::showEvent(QShowEvent *event) {
@@ -393,7 +355,12 @@ SettingsWindow::SettingsWindow(QWidget *parent) : QFrame(parent) {
   QObject::connect(map_panel, &MapPanel::closeSettings, this, &SettingsWindow::closeSettings);
 #endif
 
-  const int padding = panels.size() > 3 ? 25 : 35;
+  panels.push_back({"SP - General", new SPGeneralPanel(this)});
+  panels.push_back({"SP - Controls", new SPControlsPanel(this)});
+  panels.push_back({"SP - Vehicles", new SPVehiclesPanel(this)});
+  panels.push_back({"SP - Visuals", new SPVisualsPanel(this)});
+
+  const int padding = panels.size() > 3 ? 5 : 35;
 
   nav_btns = new QButtonGroup(this);
   for (auto &[name, panel] : panels) {
@@ -405,7 +372,7 @@ SettingsWindow::SettingsWindow(QWidget *parent) : QFrame(parent) {
         color: grey;
         border: none;
         background: none;
-        font-size: 65px;
+        font-size: 50px;
         font-weight: 500;
         padding-top: %1px;
         padding-bottom: %1px;
@@ -450,10 +417,4 @@ SettingsWindow::SettingsWindow(QWidget *parent) : QFrame(parent) {
       background-color: black;
     }
   )");
-}
-
-void SettingsWindow::hideEvent(QHideEvent *event) {
-#ifdef QCOM
-  HardwareEon::close_activities();
-#endif
 }

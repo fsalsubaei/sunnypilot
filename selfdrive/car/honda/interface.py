@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 from cereal import car
 from panda import Panda
+from common.conversions import Conversions as CV
 from common.numpy_fast import interp
-from common.params import Params
-from selfdrive.car.honda.values import CarControllerParams, CruiseButtons, HondaFlags, CAR, HONDA_BOSCH, HONDA_NIDEC_ALT_SCM_MESSAGES, HONDA_BOSCH_ALT_BRAKE_SIGNAL
+from selfdrive.car.honda.values import CarControllerParams, CruiseButtons, HondaFlags, CAR, HONDA_BOSCH, HONDA_NIDEC_ALT_SCM_MESSAGES, HONDA_BOSCH_ALT_BRAKE_SIGNAL, CruiseSetting
 from selfdrive.car import STD_CARGO_KG, CivicParams, scale_rot_inertia, scale_tire_stiffness, gen_empty_fingerprint, get_safety_config
 from selfdrive.car.interfaces import CarInterfaceBase
 from selfdrive.car.disable_ecu import disable_ecu
-from selfdrive.config import Conversions as CV
+from common.realtime import DT_CTRL
+from selfdrive.controls.lib.events import ET
+from common.params import Params
 
 
 ButtonType = car.CarState.ButtonEvent.Type
@@ -16,6 +18,9 @@ TransmissionType = car.CarParams.TransmissionType
 
 
 class CarInterface(CarInterfaceBase):
+  def __init__(self, CP, CarController, CarState):
+    super().__init__(CP, CarController, CarState)
+
   @staticmethod
   def get_pid_accel_limits(CP, current_speed, cruise_speed):
     if CP.carFingerprint in HONDA_BOSCH:
@@ -28,7 +33,7 @@ class CarInterface(CarInterfaceBase):
       return CarControllerParams.NIDEC_ACCEL_MIN, interp(current_speed, ACCEL_MAX_BP, ACCEL_MAX_VALS)
 
   @staticmethod
-  def get_params(candidate, fingerprint=gen_empty_fingerprint(), car_fw=[]):  # pylint: disable=dangerous-default-value
+  def get_params(candidate, fingerprint=gen_empty_fingerprint(), car_fw=[], disable_radar=False):  # pylint: disable=dangerous-default-value
     ret = CarInterfaceBase.get_std_params(candidate, fingerprint)
     ret.carName = "honda"
 
@@ -38,7 +43,7 @@ class CarInterface(CarInterfaceBase):
 
       # Disable the radar and let openpilot control longitudinal
       # WARNING: THIS DISABLES AEB!
-      ret.openpilotLongitudinalControl = Params().get_bool("DisableRadar")
+      ret.openpilotLongitudinalControl = disable_radar
 
       ret.pcmCruise = not ret.openpilotLongitudinalControl
     else:
@@ -215,8 +220,8 @@ class CarInterface(CarInterfaceBase):
       ret.wheelbase = 2.68
       ret.centerToFront = ret.wheelbase * 0.38
       ret.steerRatio = 15.0  # as spec
-      ret.lateralParams.torqueBP, ret.lateralParams.torqueV = [[0, 1000], [0, 1000]]  # TODO: determine if there is a dead zone at the top end
       tire_stiffness_factor = 0.444
+      ret.lateralParams.torqueBP, ret.lateralParams.torqueV = [[0, 1000], [0, 1000]]  # TODO: determine if there is a dead zone at the top end
       ret.lateralTuning.pid.kpV, ret.lateralTuning.pid.kiV = [[0.8], [0.24]]
 
     elif candidate == CAR.ACURA_RDX_3G:
@@ -321,6 +326,12 @@ class CarInterface(CarInterfaceBase):
     ret.steerRateCost = 0.5
     ret.steerLimitTimer = 0.8
 
+    ret.latActive = False
+
+    ret.standStill = False
+
+    Params().put("CarMake", "3")
+
     return ret
 
   @staticmethod
@@ -329,16 +340,14 @@ class CarInterface(CarInterfaceBase):
       disable_ecu(logcan, sendcan, bus=1, addr=0x18DAB0F1, com_cont_req=b'\x28\x83\x03')
 
   # returns a car.CarState
-  def update(self, c, can_strings):
-    # ******************* do can recv *******************
-    self.cp.update_strings(can_strings)
-    self.cp_cam.update_strings(can_strings)
-    if self.cp_body:
-      self.cp_body.update_strings(can_strings)
-
+  def _update(self, c):
     ret = self.CS.update(self.cp, self.cp_cam, self.cp_body)
 
-    ret.canValid = self.cp.can_valid and self.cp_cam.can_valid and (self.cp_body is None or self.cp_body.can_valid)
+    ret.madsEnabled = self.CS.madsEnabled
+    ret.accEnabled = self.CS.accEnabled
+    ret.leftBlinkerOn = self.CS.leftBlinkerOn
+    ret.rightBlinkerOn = self.CS.rightBlinkerOn
+    ret.belowLaneChangeSpeed = self.CS.belowLaneChangeSpeed
 
     buttonEvents = []
 
@@ -370,70 +379,92 @@ class CarInterface(CarInterfaceBase):
       else:
         be.pressed = False
         but = self.CS.prev_cruise_setting
-      if but == 1:
+      if but == CruiseSetting.LKAS_BUTTON:
         be.type = ButtonType.altButton1
       # TODO: more buttons?
       buttonEvents.append(be)
     ret.buttonEvents = buttonEvents
 
+    extraGears = []
+    if not (self.CS.CP.openpilotLongitudinalControl or self.CS.CP.enableGasInterceptor):
+      extraGears = [car.CarState.GearShifter.sport, car.CarState.GearShifter.low]
+
     # events
-    events = self.create_common_events(ret, pcm_enable=False)
+    events = self.create_common_events(ret, extra_gears=extraGears, pcm_enable=False)
     if self.CS.brake_error:
       events.add(EventName.brakeUnavailable)
-    if self.CS.park_brake:
-      events.add(EventName.parkBrake)
 
-    if self.CP.pcmCruise and ret.vEgo < self.CP.minEnableSpeed:
+    if self.CP.pcmCruise and ret.vEgo < self.CP.minEnableSpeed and not self.CS.madsEnabled:
       events.add(EventName.belowEngageSpeed)
 
-    if self.CP.pcmCruise:
-      # we engage when pcm is active (rising edge)
-      if ret.cruiseState.enabled and not self.CS.out.cruiseState.enabled:
-        events.add(EventName.pcmEnable)
-      elif not ret.cruiseState.enabled and (c.actuators.accel >= 0. or not self.CP.openpilotLongitudinalControl):
-        # it can happen that car cruise disables while comma system is enabled: need to
-        # keep braking if needed or if the speed is very low
-        if ret.vEgo < self.CP.minEnableSpeed + 2.:
-          # non loud alert if cruise disables below 25mph as expected (+ a little margin)
-          events.add(EventName.speedTooLow)
-        else:
-          events.add(EventName.cruiseDisabled)
+    self.CS.disengageByBrake = self.CS.disengageByBrake or ret.disengageByBrake
+
+    #if self.CP.pcmCruise:
+    #  # we engage when pcm is active (rising edge)
+    #  if ret.cruiseState.enabled and not self.CS.out.cruiseState.enabled:
+    #    events.add(EventName.pcmEnable)
+    #  elif not ret.cruiseState.enabled and (c.actuators.accel >= 0. or not self.CP.openpilotLongitudinalControl):
+    #    # it can happen that car cruise disables while comma system is enabled: need to
+    #    # keep braking if needed or if the speed is very low
+    #    if ret.vEgo < self.CP.minEnableSpeed + 2.:
+    #      # non loud alert if cruise disables below 25mph as expected (+ a little margin)
+    #      events.add(EventName.speedTooLow)
+    #    else:
+    #      events.add(EventName.cruiseDisabled)
     if self.CS.CP.minEnableSpeed > 0 and ret.vEgo < 0.001:
       events.add(EventName.manualRestart)
 
+    enable_pressed = False
+    enable_from_brake = False
+
+    if self.CS.disengageByBrake and not ret.brakePressed and not ret.brakeHoldActive and not ret.parkingBrake and self.CS.madsEnabled:
+      enable_pressed = True
+      enable_from_brake = True
+
+    if not ret.brakePressed and not ret.brakeHoldActive and not ret.parkingBrake:
+      self.CS.disengageByBrake = False
+      ret.disengageByBrake = False
+
     # handle button presses
     for b in ret.buttonEvents:
-
       # do enable on both accel and decel buttons
       if b.type in (ButtonType.accelCruise, ButtonType.decelCruise) and not b.pressed:
-        if not self.CP.pcmCruise:
-          events.add(EventName.buttonEnable)
-
+        enable_pressed = True
+      # do disable on MADS button if ACC is disabled
+      if b.type in [ButtonType.altButton1] and b.pressed:
+        if not self.CS.madsEnabled: # disabled MADS
+          if not ret.cruiseState.enabled:
+            events.add(EventName.buttonCancel)
+          else:
+            events.add(EventName.manualSteeringRequired)
+        else: # enabled MADS
+          if not ret.cruiseState.enabled:
+            enable_pressed = True
       # do disable on button down
       if b.type == ButtonType.cancel and b.pressed:
-        events.add(EventName.buttonCancel)
+        if not self.CS.madsEnabled:
+          events.add(EventName.buttonCancel)
+        else:
+          events.add(EventName.manualLongitudinalRequired)
+
+    if (ret.cruiseState.enabled or self.CS.madsEnabled) and enable_pressed:
+      if enable_from_brake:
+        events.add(EventName.silentButtonEnable)
+      else:
+        events.add(EventName.buttonEnable)
+
+    self.CP.latActive = True if self.CC.lat_active else False
+
+    if self.CS.cruiseState_standstill or self.CC.standstill_status == 1:
+      self.CP.standStill = True
+    else:
+      self.CP.standStill = False
 
     ret.events = events.to_msg()
 
-    self.CS.out = ret.as_reader()
-    return self.CS.out
+    return ret
 
   # pass in a car.CarControl
   # to be called @ 100hz
   def apply(self, c):
-    hud_control = c.hudControl
-    if hud_control.speedVisible:
-      hud_v_cruise = hud_control.setSpeed * CV.MS_TO_KPH
-    else:
-      hud_v_cruise = 255
-
-    ret = self.CC.update(c.enabled, c.active, self.CS, self.frame,
-                         c.actuators,
-                         c.cruiseControl.cancel,
-                         hud_v_cruise,
-                         hud_control.lanesVisible,
-                         hud_show_car=hud_control.leadVisible,
-                         hud_alert=hud_control.visualAlert)
-
-    self.frame += 1
-    return ret
+    return self.CC.update(c, self.CS)

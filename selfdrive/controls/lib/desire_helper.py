@@ -1,6 +1,7 @@
 from cereal import log
+from common.conversions import Conversions as CV
 from common.realtime import DT_MDL
-from selfdrive.config import Conversions as CV
+from common.params import Params
 
 LaneChangeState = log.LateralPlan.LaneChangeState
 LaneChangeDirection = log.LateralPlan.LaneChangeDirection
@@ -39,8 +40,12 @@ class DesireHelper:
     self.keep_pulse_timer = 0.0
     self.prev_one_blinker = False
     self.desire = log.LateralPlan.Desire.none
+    self.lane_change_wait_timer = 0
 
   def update(self, carstate, active, lane_change_prob):
+    lane_change_set_timer = int(Params().get("AutoLaneChangeTimer", encoding="utf8"))
+    lane_change_auto_timer = 0.0 if lane_change_set_timer == 0 else 0.1 if lane_change_set_timer == 1 else 0.5 if lane_change_set_timer == 2 \
+      else 1.0 if lane_change_set_timer == 3 else 1.5 if lane_change_set_timer == 4 else 2.0
     v_ego = carstate.vEgo
     one_blinker = carstate.leftBlinker != carstate.rightBlinker
     below_lane_change_speed = v_ego < LANE_CHANGE_SPEED_MIN
@@ -53,6 +58,7 @@ class DesireHelper:
       if self.lane_change_state == LaneChangeState.off and one_blinker and not self.prev_one_blinker and not below_lane_change_speed:
         self.lane_change_state = LaneChangeState.preLaneChange
         self.lane_change_ll_prob = 1.0
+        self.lane_change_wait_timer = 0
 
       # LaneChangeState.preLaneChange
       elif self.lane_change_state == LaneChangeState.preLaneChange:
@@ -67,9 +73,10 @@ class DesireHelper:
         blindspot_detected = ((carstate.leftBlindspot and self.lane_change_direction == LaneChangeDirection.left) or
                               (carstate.rightBlindspot and self.lane_change_direction == LaneChangeDirection.right))
 
+        self.lane_change_wait_timer += DT_MDL
         if not one_blinker or below_lane_change_speed:
           self.lane_change_state = LaneChangeState.off
-        elif torque_applied and not blindspot_detected:
+        elif (torque_applied or (lane_change_auto_timer and self.lane_change_wait_timer > lane_change_auto_timer)) and not blindspot_detected:
           self.lane_change_state = LaneChangeState.laneChangeStarting
 
       # LaneChangeState.laneChangeStarting

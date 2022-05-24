@@ -1,11 +1,13 @@
-from cereal import car
 from collections import defaultdict
+
+from cereal import car
+from common.conversions import Conversions as CV
 from common.numpy_fast import interp
 from opendbc.can.can_define import CANDefine
 from opendbc.can.parser import CANParser
-from selfdrive.config import Conversions as CV
 from selfdrive.car.interfaces import CarStateBase
 from selfdrive.car.honda.values import CAR, DBC, STEER_THRESHOLD, HONDA_BOSCH, HONDA_NIDEC_ALT_SCM_MESSAGES, HONDA_BOSCH_ALT_BRAKE_SIGNAL
+from common.params import Params
 
 TransmissionType = car.CarParams.TransmissionType
 
@@ -88,7 +90,12 @@ def get_can_signals(CP, gearbox_msg, main_on_sig_msg):
         ("CRUISE_SPEED", "ACC_HUD"),
         ("ACCEL_COMMAND", "ACC_CONTROL"),
         ("AEB_STATUS", "ACC_CONTROL"),
+        ("BRAKE_LIGHTS", "ACC_CONTROL", 0),
       ]
+      if CP.carFingerprint in (CAR.CIVIC_BOSCH, CAR.CRV_HYBRID):
+        signals += [
+          ("HUD_LEAD", "ACC_HUD", 0),
+        ]
       checks += [
         ("ACC_HUD", 10),
         ("ACC_CONTROL", 50),
@@ -168,8 +175,34 @@ class CarState(CarStateBase):
     self.cruise_setting = 0
     self.v_cruise_pcm_prev = 0
 
+    self.params = Params()
+    self.enable_mads = self.params.get_bool("EnableMads")
+    self.mads_disengage_lateral_on_brake = self.params.get_bool("DisengageLateralOnBrake")
+
+    self.accEnabled = False
+    self.madsEnabled = False
+    self.leftBlinkerOn = False
+    self.rightBlinkerOn = False
+    self.disengageByBrake = False
+    self.belowLaneChangeSpeed = True
+
+    self.prev_cruiseState_enabled = False
+
+    self.acc_mads_combo = None
+    self.prev_acc_mads_combo = None
+
+    self.cruiseState_standstill = False
+
+    self.gap_adjust_cruise_tr = 0
+
   def update(self, cp, cp_cam, cp_body):
     ret = car.CarState.new_message()
+
+    self.acc_mads_combo = self.params.get_bool("AccMadsCombo")
+    self.visual_brake_lights = self.params.get_bool("BrakeLights")
+    self.gap_adjust_cruise = Params().get_bool("GapAdjustCruise")
+    self.gap_adjust_cruise_mode = int(Params().get("GapAdjustCruiseMode"))
+    self.gap_adjust_cruise_tr = int(Params().get("GapAdjustCruiseTr"))
 
     # car params
     v_weight_v = [0., 1.]  # don't trust smooth speed at low values to avoid premature zero snapping
@@ -180,28 +213,18 @@ class CarState(CarStateBase):
     self.prev_cruise_setting = self.cruise_setting
 
     # ******************* parse out can *******************
-    # TODO: find wheels moving bit in dbc
+    # STANDSTILL->WHEELS_MOVING bit can be noisy around zero, so use XMISSION_SPEED
+    # panda checks if the signal is non-zero
+    ret.standstill = cp.vl["ENGINE_DATA"]["XMISSION_SPEED"] < 1e-5
+    ret.standStill = self.CP.standStill
     if self.CP.carFingerprint in (CAR.ACCORD, CAR.ACCORDH, CAR.CIVIC_BOSCH, CAR.CIVIC_BOSCH_DIESEL, CAR.CRV_HYBRID, CAR.INSIGHT, CAR.ACURA_RDX_3G, CAR.HONDA_E):
-      ret.standstill = cp.vl["ENGINE_DATA"]["XMISSION_SPEED"] < 0.1
       ret.doorOpen = bool(cp.vl["SCM_FEEDBACK"]["DRIVERS_DOOR_OPEN"])
-    elif self.CP.carFingerprint == CAR.ODYSSEY_CHN:
-      ret.standstill = cp.vl["ENGINE_DATA"]["XMISSION_SPEED"] < 0.1
-      ret.doorOpen = bool(cp.vl["SCM_BUTTONS"]["DRIVERS_DOOR_OPEN"])
-    elif self.CP.carFingerprint in (CAR.FREED, CAR.HRV):
-      ret.standstill = not cp.vl["STANDSTILL"]["WHEELS_MOVING"]
+    elif self.CP.carFingerprint in (CAR.ODYSSEY_CHN, CAR.FREED, CAR.HRV):
       ret.doorOpen = bool(cp.vl["SCM_BUTTONS"]["DRIVERS_DOOR_OPEN"])
     else:
-      ret.standstill = not cp.vl["STANDSTILL"]["WHEELS_MOVING"]
       ret.doorOpen = any([cp.vl["DOORS_STATUS"]["DOOR_OPEN_FL"], cp.vl["DOORS_STATUS"]["DOOR_OPEN_FR"],
                           cp.vl["DOORS_STATUS"]["DOOR_OPEN_RL"], cp.vl["DOORS_STATUS"]["DOOR_OPEN_RR"]])
     ret.seatbeltUnlatched = bool(cp.vl["SEATBELT_STATUS"]["SEATBELT_DRIVER_LAMP"] or not cp.vl["SEATBELT_STATUS"]["SEATBELT_DRIVER_LATCHED"])
-
-    steer_status = self.steer_status_values[cp.vl["STEER_STATUS"]["STEER_STATUS"]]
-    ret.steerError = steer_status not in ("NORMAL", "NO_TORQUE_ALERT_1", "NO_TORQUE_ALERT_2", "LOW_SPEED_LOCKOUT", "TMP_FAULT")
-    # NO_TORQUE_ALERT_2 can be caused by bump OR steering nudge from driver
-    self.steer_not_allowed = steer_status not in ("NORMAL", "NO_TORQUE_ALERT_2")
-    # LOW_SPEED_LOCKOUT is not worth a warning
-    ret.steerWarning = steer_status not in ("NORMAL", "LOW_SPEED_LOCKOUT", "NO_TORQUE_ALERT_2")
 
     if self.CP.openpilotLongitudinalControl:
       self.brake_error = cp.vl["STANDSTILL"]["BRAKE_ERROR_1"] or cp.vl["STANDSTILL"]["BRAKE_ERROR_2"]
@@ -220,6 +243,8 @@ class CarState(CarStateBase):
     ret.vEgoRaw = (1. - v_weight) * cp.vl["ENGINE_DATA"]["XMISSION_SPEED"] * CV.KPH_TO_MS * self.CP.wheelSpeedFactor + v_weight * v_wheel
     ret.vEgo, ret.aEgo = self.update_speed_kf(ret.vEgoRaw)
 
+    self.belowLaneChangeSpeed = ret.vEgo < (30 * CV.MPH_TO_MS)
+
     ret.steeringAngleDeg = cp.vl["STEERING_SENSORS"]["STEER_ANGLE"]
     ret.steeringRateDeg = cp.vl["STEERING_SENSORS"]["STEER_ANGLE_RATE"]
 
@@ -230,20 +255,24 @@ class CarState(CarStateBase):
       250, cp.vl["SCM_FEEDBACK"]["LEFT_BLINKER"], cp.vl["SCM_FEEDBACK"]["RIGHT_BLINKER"])
     ret.brakeHoldActive = cp.vl["VSA_STATUS"]["BRAKE_HOLD_ACTIVE"] == 1
 
+    self.leftBlinkerOn = cp.vl["SCM_FEEDBACK"]["LEFT_BLINKER"] != 0
+    self.rightBlinkerOn = cp.vl["SCM_FEEDBACK"]["RIGHT_BLINKER"] != 0
+
+    # TODO: set for all cars
     if self.CP.carFingerprint in (CAR.CIVIC, CAR.ODYSSEY, CAR.ODYSSEY_CHN, CAR.CRV_5G, CAR.ACCORD, CAR.ACCORDH, CAR.CIVIC_BOSCH,
                                   CAR.CIVIC_BOSCH_DIESEL, CAR.CRV_HYBRID, CAR.INSIGHT, CAR.ACURA_RDX_3G, CAR.HONDA_E):
-      self.park_brake = cp.vl["EPB_STATUS"]["EPB_STATE"] != 0
-    else:
-      self.park_brake = 0  # TODO
+      ret.parkingBrake = cp.vl["EPB_STATUS"]["EPB_STATE"] != 0
 
     gear = int(cp.vl[self.gearbox_msg]["GEAR_SHIFTER"])
     ret.gearShifter = self.parse_gear_shifter(self.shifter_values.get(gear, None))
 
     if self.CP.enableGasInterceptor:
-      ret.gas = (cp.vl["GAS_SENSOR"]["INTERCEPTOR_GAS"] + cp.vl["GAS_SENSOR"]["INTERCEPTOR_GAS2"]) / 2.
+      # Same threshold as panda, equivalent to 1e-5 with previous DBC scaling
+      ret.gas = (cp.vl["GAS_SENSOR"]["INTERCEPTOR_GAS"] + cp.vl["GAS_SENSOR"]["INTERCEPTOR_GAS2"]) // 2
+      ret.gasPressed = ret.gas > 492
     else:
       ret.gas = cp.vl["POWERTRAIN_DATA"]["PEDAL_GAS"]
-    ret.gasPressed = ret.gas > 1e-5
+      ret.gasPressed = ret.gas > 1e-5
 
     ret.steeringTorque = cp.vl["STEER_STATUS"]["STEER_TORQUE_SENSOR"]
     ret.steeringTorqueEps = cp.vl["STEER_MOTOR_TORQUE"]["MOTOR_TORQUE"]
@@ -259,6 +288,8 @@ class CarState(CarStateBase):
         self.v_cruise_pcm_prev = ret.cruiseState.speed
     else:
       ret.cruiseState.speed = cp.vl["CRUISE"]["CRUISE_SPEED_PCM"] * CV.KPH_TO_MS
+
+    self.cruiseState_standstill = ret.cruiseState.standstill
 
     if self.CP.carFingerprint in HONDA_BOSCH_ALT_BRAKE_SIGNAL:
       ret.brakePressed = cp.vl["BRAKE_MODULE"]["BRAKE_PRESSED"] != 0
@@ -283,6 +314,90 @@ class CarState(CarStateBase):
     if self.CP.carFingerprint in (CAR.PILOT, CAR.PASSPORT, CAR.RIDGELINE):
       if ret.brake > 0.1:
         ret.brakePressed = True
+
+    if self.visual_brake_lights:
+      if self.CP.carFingerprint in (CAR.CIVIC, CAR.ODYSSEY, CAR.ODYSSEY_CHN, CAR.CRV_5G, CAR.ACCORD, CAR.ACCORDH, CAR.CIVIC_BOSCH,
+                                      CAR.CIVIC_BOSCH_DIESEL, CAR.CRV_HYBRID, CAR.INSIGHT, CAR.ACURA_RDX_3G, CAR.HONDA_E):
+        ret.brakeLights = bool(ret.brakePressed or cp.vl["ACC_CONTROL"]['BRAKE_LIGHTS'] != 0 or ret.brake > 0.4 or ret.parkingBrake) if not self.CP.openpilotLongitudinalControl else \
+                           bool(ret.brakePressed or ret.brake > 0.4 or ret.parkingBrake)
+      elif self.CP.carFingerprint in HONDA_BOSCH and self.CP.carFingerprint not in (CAR.CIVIC, CAR.ODYSSEY, CAR.ODYSSEY_CHN, CAR.CRV_5G, CAR.ACCORD, CAR.ACCORDH, CAR.CIVIC_BOSCH,
+                                      CAR.CIVIC_BOSCH_DIESEL, CAR.CRV_HYBRID, CAR.INSIGHT, CAR.ACURA_RDX_3G, CAR.HONDA_E):
+        ret.brakeLights = bool(ret.brakePressed or cp.vl["ACC_CONTROL"]['BRAKE_LIGHTS'] != 0 or ret.brake > 0.4) if not self.CP.openpilotLongitudinalControl else \
+                           bool(ret.brakePressed or ret.brake > 0.4)
+      else:
+        ret.brakeLights = bool(ret.brakePressed)
+
+    if self.CP.openpilotLongitudinalControl:
+      if self.gap_adjust_cruise:
+        if self.gap_adjust_cruise_mode in (0, 2):
+          if self.prev_cruise_setting != 3: # DISTANCE_ADJ
+            if self.cruise_setting == 3:
+              self.gap_adjust_cruise_tr -= 1
+              if self.gap_adjust_cruise_tr < 0:
+                self.gap_adjust_cruise_tr = 3
+              Params().put("GapAdjustCruiseTr", str(self.gap_adjust_cruise_tr))
+      else:
+        self.gap_adjust_cruise_tr = 0
+
+    ret.gapAdjustCruiseTr = self.gap_adjust_cruise_tr
+
+    if ret.cruiseState.available:
+      if not self.CP.pcmCruise:
+        if self.prev_cruise_buttons == 3: # SET-
+          if self.cruise_buttons != 3:
+            self.accEnabled = True
+        elif self.prev_cruise_buttons == 4: # RESUME+
+          if self.cruise_buttons != 4:
+            self.accEnabled = True
+      if self.enable_mads:
+        if self.prev_cruise_setting != 1:
+          if self.cruise_setting == 1:
+            self.madsEnabled = not self.madsEnabled
+        if self.acc_mads_combo:
+          if not self.prev_acc_mads_combo and ret.cruiseState.enabled:
+            self.madsEnabled = True
+          self.prev_acc_mads_combo = ret.cruiseState.enabled
+    else:
+      self.madsEnabled = False
+      self.accEnabled = False
+
+    if not self.CP.pcmCruise or (self.CP.pcmCruise and self.CP.minEnableSpeed > 0) or not self.enable_mads:
+      if self.prev_cruise_buttons != 2: # CANCEL
+        if self.cruise_buttons == 2:
+          self.accEnabled = False
+          if not self.enable_mads:
+            self.madsEnabled = False
+      if ret.brakePressed:
+        self.accEnabled = False
+        if not self.enable_mads:
+          self.madsEnabled = False
+
+    if self.CP.pcmCruise and self.CP.minEnableSpeed > 0:
+      if ret.gasPressed and not ret.cruiseState.enabled:
+        self.accEnabled = False
+      self.accEnabled = ret.cruiseState.enabled or self.accEnabled
+
+    if not self.CP.pcmCruise:
+      ret.cruiseState.enabled = self.accEnabled
+
+    if not self.enable_mads:
+      if ret.cruiseState.enabled and not self.prev_cruiseState_enabled:
+        self.madsEnabled = True
+    self.prev_cruiseState_enabled = ret.cruiseState.enabled
+
+    ret.steerFaultPermanent = False
+    ret.steerFaultTemporary = False
+
+    if self.madsEnabled:
+      steer_status = self.steer_status_values[cp.vl["STEER_STATUS"]["STEER_STATUS"]]
+      ret.steerFaultPermanent = steer_status not in ("NORMAL", "NO_TORQUE_ALERT_1", "NO_TORQUE_ALERT_2", "LOW_SPEED_LOCKOUT", "TMP_FAULT")
+      if (not self.belowLaneChangeSpeed and (self.rightBlinkerOn or self.leftBlinkerOn)) or\
+        not (self.rightBlinkerOn or self.leftBlinkerOn):
+        # LOW_SPEED_LOCKOUT is not worth a warning
+        # NO_TORQUE_ALERT_2 can be caused by bump or steering nudge from driver
+        ret.steerFaultTemporary = steer_status not in ("NORMAL", "LOW_SPEED_LOCKOUT", "NO_TORQUE_ALERT_2")
+
+    ret.latActive = self.CP.latActive
 
     # TODO: discover the CAN msg that has the imperial unit bit for all other cars
     if self.CP.carFingerprint in (CAR.CIVIC, ):

@@ -37,9 +37,55 @@ def manager_init() -> None:
   params.clear_all(ParamKeyType.CLEAR_ON_MANAGER_START)
 
   default_params: List[Tuple[str, Union[str, bytes]]] = [
+    ("AccMadsCombo", "1"),
+    ("AutoLaneChangeTimer", "0"),
+    ("BrakeLights", "0"),
+    ("BrightnessControl", "0"),
+    ("CameraOffset", "0"),
+    ("CarMake", "0"),
+    ("CarModel", ""),
     ("CompletedTrainingVersion", "0"),
+    ("CustomOffsets", "0"),
+    ("CustomTorqueLateral", "0"),
+    ("DevUI", "1"),
+    ("DevUIRow", "1"),
+    ("DisableOnroadUploads", "0"),
+    ("DisengageLateralOnBrake", "1"),
+    ("DisengageOnAccelerator", "0"),
+    ("DynamicLaneProfile", "2"),
+    ("EnableMads", "1"),
+    ("EndToEndToggle", "1"),
+    ("EnhancedScc", "0"),
+    ("GapAdjustCruise", "1"),
+    ("GapAdjustCruiseMode", "0"),
+    ("GapAdjustCruiseTr", "4"),
+    ("GpxDeleteAfterUpload", "1"),
+    ("GpxDeleteIfUploaded", "1"),
     ("HasAcceptedTerms", "0"),
+    ("HandsOnWheelMonitoring", "0"),
+    ("LastSpeedLimitSignTap", "0"),
+    ("MapTurnSpeedControl", "0"),
+    ("MaxTimeOffroad", "9"),
+    ("NoOffroadFix", "0"),
+    ("OnroadScreenOff", "0"),
+    ("OnroadScreenOffBrightness", "50"),
     ("OpenpilotEnabledToggle", "1"),
+    ("PathOffset", "0"),
+    ("PrebuiltOn", "0"),
+    ("ReverseAccChange", "0"),
+    ("ShowDebugUI", "1"),
+    ("SpeedLimitControl", "1"),
+    ("SpeedLimitPercOffset", "0"),
+    ("SpeedLimitStyle", "0"),
+    ("SpeedLimitValueOffset", "0"),
+    ("StandStillTimer", "1"),
+    ("TimeValidBypass", "0"),
+    ("TorqueDeadzoneDeg", "0"),
+    ("TorqueFriction", "1"),
+    ("TorqueMaxLatAccel", "25"),
+    ("UploadRaw", "0"),
+    ("UploadHiRes", "0"),
+    ("VisionTurnSpeedControl", "1"),
   ]
   if not PC:
     default_params.append(("LastUpdateTime", datetime.datetime.utcnow().isoformat().encode('utf8')))
@@ -54,6 +100,10 @@ def manager_init() -> None:
   for k, v in default_params:
     if params.get(k) is None:
       params.put(k, v)
+
+  # parameters set by Environment Variables
+  if os.getenv("HANDSMONITORING") is not None:
+    params.put_bool("HandsOnWheelMonitoring", bool(int(os.getenv("HANDSMONITORING", "0"))))
 
   # is this dashcam?
   if os.getenv("PASSIVE") is not None:
@@ -127,26 +177,16 @@ def manager_thread() -> None:
     ignore.append("pandad")
   ignore += [x for x in os.getenv("BLOCK", "").split(",") if len(x) > 0]
 
-  ensure_running(managed_processes.values(), started=False, not_run=ignore)
-
-  started_prev = False
-  sm = messaging.SubMaster(['deviceState'])
+  sm = messaging.SubMaster(['deviceState', 'carParams'], poll=['deviceState'])
   pm = messaging.PubMaster(['managerState'])
+
+  ensure_running(managed_processes.values(), False, params=params, CP=sm['carParams'], not_run=ignore)
 
   while True:
     sm.update()
-    not_run = ignore[:]
 
     started = sm['deviceState'].started
-    driverview = params.get_bool("IsDriverViewEnabled")
-    ensure_running(managed_processes.values(), started, driverview, not_run)
-
-    # trigger an update after going offroad
-    if started_prev and not started and 'updated' in managed_processes:
-      os.sync()
-      managed_processes['updated'].signal(signal.SIGHUP)
-
-    started_prev = started
+    ensure_running(managed_processes.values(), started, params=params, CP=sm['carParams'], not_run=ignore)
 
     running = ' '.join("%s%s\u001b[0m" % ("\u001b[32m" if p.proc.is_alive() else "\u001b[31m", p.name)
                        for p in managed_processes.values() if p.proc)
